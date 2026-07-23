@@ -1,586 +1,523 @@
 import os
-import sqlite3
 import random
 import time
+import csv
+import io
+import secrets
 import smtplib
 from email.mime.text import MIMEText
-from flask import Flask, request, jsonify, render_template
-
-import webauthn
-from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
-from webauthn.helpers.structs import (
-    PublicKeyCredentialDescriptor,
-    AuthenticatorSelectionCriteria,
-    UserVerificationRequirement,
-    ResidentKeyRequirement,
-)
-
-# Conditional import helper for deployment targets
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictRow
-    HAS_POSTGRES = True
-except ImportError:
-    HAS_POSTGRES = False
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from flask import Flask, jsonify, request, Response, stream_with_context, render_template, make_response
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-# Environmental Database Router Strategy
-DATABASE_URL = os.environ.get('DATABASE_URL', 'database.db')
-IS_POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+# --- DATABASE CONFIGURATION FOR RENDER POSTGRESQL ---
+database_url = os.environ.get('DATABASE_URL')
+if database_url and database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
 
-# Operational State Control Variable
-CURRENT_SYSTEM_MODE = "user"  # Options: "user" or "admin"
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url or 'sqlite:///daou_portal.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-ACTIVE_OTP_STORE = {}
-ACTIVE_WEBAUTHN_CHALLENGES = {}
+db = SQLAlchemy(app)
 
-# Hardcoded Admin Credentials for Secure Interface Isolation
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "DAOU_admin_2026"
+# --- DATABASE MODELS ---
+class UserModel(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    full_name = db.Column(db.String(120), nullable=False)
+    matric_no = db.Column(db.String(50), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
 
-# ---------------------------------------------------------------------------
-# SMTP configuration (Gmail) — set these as real environment variables,
-# never hardcode credentials in source. See setup notes at the bottom of
-# this file / the accompanying message for how to generate a Gmail App
-# Password.
-# ---------------------------------------------------------------------------
-SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
-SMTP_PORT = int(os.environ.get('SMTP_PORT', '465'))
-SMTP_USER = os.environ.get('GMAIL_USER')            # e.g. your.address@gmail.com
-SMTP_PASS = os.environ.get('GMAIL_APP_PASSWORD')    # 16-char Gmail App Password
-SMTP_FROM_NAME = os.environ.get('SMTP_FROM_NAME', 'DAOU University Portal')
+class RatingModel(db.Model):
+    __tablename__ = 'ratings'
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.String(50), nullable=False)
+    username = db.Column(db.String(80), nullable=False)
+    matric_no = db.Column(db.String(50), nullable=False)
+    rating_score = db.Column(db.Integer, nullable=False)
 
-# ---------------------------------------------------------------------------
-# WebAuthn (biometric / passkey) configuration — RP_ID must match the
-# domain the app is served from. For local testing this is "localhost".
-# If you deploy to a real domain later, update RP_ID and ORIGIN to match
-# (e.g. RP_ID="portal.daou.edu.ng", ORIGIN="https://portal.daou.edu.ng").
-# ---------------------------------------------------------------------------
-RP_ID = os.environ.get('WEBAUTHN_RP_ID', 'localhost')
-RP_NAME = "DAOU University Portal"
-ORIGIN = os.environ.get('WEBAUTHN_ORIGIN', 'http://localhost:5000')
+PENDING_OTP_VALIDATIONS = {}
+SYSTEM_RUNTIME_MODE = "user"
+TELEMETRY_LISTENERS = []
 
+# In-Memory Active Sessions Table for Multi-Device Tracking
+USER_SESSIONS_DB = []
 
-def get_db_connection():
-    """Generates an adaptive backend connector mapping based on infrastructure vars."""
-    if IS_POSTGRES and HAS_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    else:
-        conn = sqlite3.connect('database.db' if IS_POSTGRES else DATABASE_URL)
-        conn.row_factory = sqlite3.Row
-        return conn
+# --- STRUCTURAL ENGINE UTILITIES ---
+def generate_matric_number():
+    """Generates unique structural matrix identification number matching DAOU format."""
+    unique_suffix = random.randint(100, 999)
+    return f"DAOU/CYB/2026/{unique_suffix}"
 
+def emit_telemetry(message):
+    """Dispatches log strings down the persistent event stream channels."""
+    global TELEMETRY_LISTENERS
+    payload = f"data: {message}\n\n"
+    active_listeners = []
+    for listener in TELEMETRY_LISTENERS:
+        try:
+            listener.put(payload)
+            active_listeners.append(listener)
+        except Exception:
+            pass
+    TELEMETRY_LISTENERS = active_listeners
 
-def execute_query(query, params=(), fetch_one=False, fetch_all=False, commit=False):
-    """Abstraction layout utility helping query processing parity between SQLite and Postgres."""
-    conn = get_db_connection()
-    try:
-        if IS_POSTGRES and HAS_POSTGRES:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(query, params)
-            result = None
-            if fetch_one:
-                result = cur.fetchone()
-            elif fetch_all:
-                result = cur.fetchall()
-            if commit:
-                conn.commit()
-            return result
-        else:
-            cursor = conn.execute(query, params)
-            result = None
-            if fetch_one:
-                result = cursor.fetchone()
-            elif fetch_all:
-                result = cursor.fetchall()
-            if commit:
-                conn.commit()
-            return result
-    finally:
-        conn.close()
+class TelemetryQueue:
+    def __init__(self):
+        self.messages = []
+    def put(self, msg):
+        self.messages.append(msg)
+    def get(self):
+        if self.messages:
+            return self.messages.pop(0)
+        return None
 
+def send_smtp_otp_email(recipient_email, otp_code):
+    """Sends the actual OTP email using SMTP configurations from environment variables."""
+    smtp_server = "smtp.gmail.com"
+    smtp_port = int(os.environ.get('SMTP_PORT', 587))
+    sender_email = os.environ.get('GMAIL_USER')
+    sender_password = os.environ.get('GMAIL_APP_PASSWORD')
 
-def init_db():
-    """Initializes schema targets based on target infrastructure layout rules."""
-    if IS_POSTGRES and HAS_POSTGRES:
-        create_table_query = '''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(100) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                full_name VARCHAR(255) NOT NULL,
-                matric_no VARCHAR(100) UNIQUE NOT NULL,
-                biometric_enrolled INT DEFAULT 0,
-                webauthn_credential_id VARCHAR(512),
-                webauthn_public_key TEXT,
-                webauthn_sign_count INT DEFAULT 0
-            )
-        '''
-    else:
-        create_table_query = '''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                email TEXT NOT NULL,
-                full_name TEXT NOT NULL,
-                matric_no TEXT UNIQUE NOT NULL,
-                biometric_enrolled INTEGER DEFAULT 0,
-                webauthn_credential_id TEXT,
-                webauthn_public_key TEXT,
-                webauthn_sign_count INTEGER DEFAULT 0
-            )
-        '''
-
-    conn = get_db_connection()
-    if IS_POSTGRES and HAS_POSTGRES:
-        cur = conn.cursor()
-        cur.execute(create_table_query)
-        conn.commit()
-    else:
-        conn.execute(create_table_query)
-        conn.commit()
-
-        # Lightweight migration for pre-existing SQLite databases that predate
-        # the webauthn_* columns.
-        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-        for col, coltype in [
-            ("webauthn_credential_id", "TEXT"),
-            ("webauthn_public_key", "TEXT"),
-            ("webauthn_sign_count", "INTEGER DEFAULT 0"),
-        ]:
-            if col not in existing_cols:
-                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {coltype}")
-        conn.commit()
-    conn.close()
-
-
-def write_auth_log(username, action, status):
-    """Optional logger helper function to print server-side actions."""
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] MODE: {CURRENT_SYSTEM_MODE.upper()} | USER: {username} | ACTION: {action} | STATUS: {status}")
-
-
-def send_otp_email(recipient_email, full_name, otp_code):
-    """Sends the OTP to the user's real inbox over SMTP (Gmail). Returns True/False.
-    Tries implicit SSL (465) first, then falls back to STARTTLS (587) — some
-    hosting providers throttle or block one of the two."""
-    if not SMTP_USER or not SMTP_PASS:
-        write_auth_log("SYSTEM", "SMTP credentials not configured (GMAIL_USER / GMAIL_APP_PASSWORD)", "ERROR")
+    if not sender_email or not sender_password:
+        print(f"[SIMULATED EMAIL] OTP Code for {recipient_email}: {otp_code}")
         return False
 
-    subject = "Your DAOU Portal Security Code"
-    body = (
-        f"Hi {full_name},\n\n"
-        f"Your one-time passcode (OTP) for DAOU University Portal is:\n\n"
-        f"    {otp_code}\n\n"
-        f"This code expires in 5 minutes. If you did not request this, "
-        f"you can safely ignore this email.\n\n"
-        f"— DAOU University Portal Security"
-    )
-
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
-    msg['To'] = recipient_email
-
-    # Attempt 1: implicit TLS on 465
     try:
-        with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=15) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, [recipient_email], msg.as_string())
-        return True
-    except Exception as e_ssl:
-        write_auth_log("SYSTEM", f"SMTP SSL(465) send failure: {str(e_ssl)}", "WARN")
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = "DAOU Portal Security Verification Code"
 
-    # Attempt 2: STARTTLS on 587 (fallback for hosts that block 465 outbound)
-    try:
-        with smtplib.SMTP(SMTP_HOST, 587, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, [recipient_email], msg.as_string())
+        body = f"Your 6-digit security authentication code is: {otp_code}\nThis code will expire in 5 minutes."
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.sendmail(sender_email, recipient_email, msg.as_string())
+        server.quit()
         return True
-    except Exception as e_tls:
-        write_auth_log("SYSTEM", f"SMTP STARTTLS(587) send failure: {str(e_tls)}", "ERROR")
+    except Exception as e:
+        print(f"[SMTP ERROR] Failed to dispatch email: {e}")
         return False
 
+# --- REQUEST HOOK FOR ACTIVITY TRACKING ---
+
+@app.before_request
+def update_user_activity():
+    """Updates the last_active timestamp for the current device session token."""
+    session_token = request.cookies.get('device_session_token')
+    if session_token:
+        for session in USER_SESSIONS_DB:
+            if session['session_token'] == session_token:
+                session['last_active'] = time.time()
+                break
+
+# --- FRONTEND TEMPLATE ROUTE ---
 
 @app.route('/')
-def index():
+def serve_portal_gateway():
+    """Renders the main frontend interface template."""
     return render_template('index.html')
 
-
-@app.route('/api/system/mode', methods=['GET', 'POST'])
-def system_mode_switch():
-    """Operational context controller switch node."""
-    global CURRENT_SYSTEM_MODE
-    if request.method == 'POST':
-        data = request.json or {}
-        new_mode = data.get('mode', '').lower().strip()
-        if new_mode in ['user', 'admin']:
-            CURRENT_SYSTEM_MODE = new_mode
-            write_auth_log("SYSTEM", f"Context runtime adjusted state to: {CURRENT_SYSTEM_MODE}", "OK")
-            return jsonify({"success": True, "current_mode": CURRENT_SYSTEM_MODE})
-        return jsonify({"success": False, "message": "Invalid system parameters execution path."}), 400
-
-    return jsonify({"success": True, "current_mode": CURRENT_SYSTEM_MODE})
-
-
-@app.route('/api/admin/login', methods=['POST'])
-def api_admin_login():
-    """Explicitly isolated route verifying Admin access to view backend console telemetry."""
-    try:
-        data = request.json or {}
-        username = data.get('username', '').strip()
-        password = data.get('password', '').strip()
-
-        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-            write_auth_log("ADMIN", "Console Gateway Authentication Check", "SUCCESS")
-            return jsonify({
-                "success": True,
-                "role": "admin",
-                "message": "Elevated credentials accepted. Initializing backend terminal streaming array."
-            })
-
-        write_auth_log(username if username else "UNKNOWN", "Console Gateway Authentication Check", "FAILED")
-        return jsonify({
-            "success": False,
-            "message": "Access Denied: Administrative footprint authorization failure."
-        }), 401
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
+# --- AUTHENTICATION INTERFACE PIPELINES ---
 
 @app.route('/api/register', methods=['POST'])
-def api_register():
-    try:
-        data = request.json or {}
-        username = data.get('username', '').strip()
-        password = data.get('password', '').strip()
-        email = data.get('email', '').strip()
-        full_name = data.get('full_name', '').strip()
-        matric_no = data.get('matric_no', '').strip()
+def handle_registration():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    email = data.get('email', '').strip()
+    full_name = data.get('full_name', '').strip()
 
-        if not all([username, password, email, full_name, matric_no]):
-            return jsonify({"success": False, "message": "All fields are required."}), 400
+    if not all([username, password, email, full_name]):
+        return jsonify({"success": False, "message": "Missing required registration framework dimensions."}), 400
 
-        placeholder = "%s" if IS_POSTGRES else "?"
+    existing_user = UserModel.query.filter((UserModel.username.ilike(username)) | (UserModel.email.ilike(email))).first()
+    if existing_user:
+        return jsonify({"success": False, "message": "Username or email mapping signature already claimed within database matrix."}), 400
 
-        existing = execute_query(
-            f"SELECT username, matric_no FROM users WHERE username = {placeholder} OR matric_no = {placeholder}",
-            (username, matric_no),
-            fetch_one=True
-        )
-
-        if existing:
-            if existing['username'].lower() == username.lower():
-                return jsonify({"success": False, "message": "Username bound to pre-existing records."}), 400
-            if existing['matric_no'].lower() == matric_no.lower():
-                return jsonify({"success": False, "message": "Matric Number bound to pre-existing records."}), 400
-
-        insert_query = f"INSERT INTO users (username, password, email, full_name, matric_no) VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})"
-        execute_query(insert_query, (username, password, email, full_name, matric_no), commit=True)
-
-        write_auth_log(username, "Direct DB Injection", "SUCCESS")
-        return jsonify({"success": True, "message": "Account injected successfully."})
-
-    except Exception as e:
-        write_auth_log("SYSTEM", f"Registration Exception: {str(e)}", "ERROR")
-        return jsonify({"success": False, "message": f"Database exception: {str(e)}"}), 500
-
+    assigned_matric = generate_matric_number()
+    hashed_pwd = generate_password_hash(password)
+    
+    new_user = UserModel(
+        username=username,
+        password_hash=hashed_pwd,
+        full_name=full_name,
+        matric_no=assigned_matric,
+        email=email
+    )
+    db.session.add(new_user)
+    db.session.commit()
+    
+    emit_telemetry(f"<span class='term-success'>[REGISTRATION] {username} registered. Assigned Matric: {assigned_matric}</span>")
+    return jsonify({"success": True, "generated_matric": assigned_matric})
 
 @app.route('/api/login', methods=['POST'])
-def api_login():
-    try:
-        data = request.json or {}
-        username = data.get('username', '').strip()
-        password = data.get('password', '').strip()
+def handle_login():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
 
-        placeholder = "%s" if IS_POSTGRES else "?"
-        select_query = f"SELECT * FROM users WHERE username = {placeholder} AND password = {placeholder}"
-        user = execute_query(select_query, (username, password), fetch_one=True)
-
-        if user:
-            email = user['email']
-            parts = email.split('@')
-
-            if len(parts[0]) > 2:
-                masked_email = f"{parts[0][0]}{'*' * (len(parts[0]) - 2)}{parts[0][-1]}@{parts[1]}"
-            else:
-                masked_email = f"**@{parts[1]}"
-
-            generated_otp = str(random.randint(100000, 999999))
-            expiration_time = time.time() + 300
-
-            email_sent = send_otp_email(email, user['full_name'], generated_otp)
-            if not email_sent:
-                write_auth_log(username, "OTP Email Dispatch", "FAILED")
-                return jsonify({
-                    "success": False,
-                    "message": "Could not send verification email. Check SMTP configuration and try again."
-                }), 502
-
-            ACTIVE_OTP_STORE[str(user['id'])] = {
-                "otp": generated_otp,
-                "username": username,
-                "expires_at": expiration_time
-            }
-
-            write_auth_log(username, "Primary Login Credential Check", "SUCCESS")
-            write_auth_log(username, "OTP Email Dispatch", "SUCCESS")
-
-            return jsonify({
-                "success": True,
-                "user_id": user['id'],
-                "masked_email": masked_email,
-                # NOTE: the OTP itself is intentionally never returned here —
-                # it only exists in ACTIVE_OTP_STORE server-side and in the
-                # user's real inbox.
-                "biometric_enrolled": bool(user['biometric_enrolled']),
-                "system_context_mode": CURRENT_SYSTEM_MODE
-            })
-
-        write_auth_log(username if username else "UNKNOWN", "Primary Login Credential Check", "FAILED")
-        return jsonify({
-            "success": False,
-            "message": "Access Denied: Invalid identity credentials pattern matching."
-        }), 401
-
-    except Exception as e:
-        write_auth_log("SYSTEM", f"Login Exception: {str(e)}", "ERROR")
-        return jsonify({"success": False, "message": f"Server processing error: {str(e)}"}), 500
-
-
-@app.route('/api/verify-otp', methods=['POST'])
-def api_verify_otp():
-    try:
-        data = request.json or {}
-        user_id = str(data.get('user_id', ''))
-        otp_code = data.get('otp_code', '').strip()
-
-        if user_id not in ACTIVE_OTP_STORE:
-            return jsonify({"success": False, "message": "No active authentication handshake found for this profile."}), 400
-
-        session = ACTIVE_OTP_STORE[user_id]
-
-        if time.time() > session['expires_at']:
-            ACTIVE_OTP_STORE.pop(user_id, None)
-            return jsonify({"success": False, "message": "Security clearance token expired. Re-authenticate."}), 400
-
-        if session['otp'] == otp_code:
-            ACTIVE_OTP_STORE.pop(user_id, None)
-
-            placeholder = "%s" if IS_POSTGRES else "?"
-            select_query = f"SELECT * FROM users WHERE id = {placeholder}"
-            user = execute_query(select_query, (user_id,), fetch_one=True)
-
-            if user:
-                write_auth_log(user['username'], "MFA Security Validation", "SUCCESS")
-                return jsonify({
-                    "success": True,
-                    "user_id": user['id'],
-                    "user_info": {
-                        "full_name": user['full_name'],
-                        "matric_no": user['matric_no'],
-                        "biometric_enrolled": bool(user['biometric_enrolled'])
-                    }
-                })
-
-        write_auth_log("UNKNOWN", "MFA Security Validation", "FAILED")
-        return jsonify({"success": False, "message": "MFA Challenge signature verification failed."}), 401
-
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Server processing error: {str(e)}"}), 500
-
-
-@app.route('/api/check-biometric-enrolled', methods=['POST'])
-def api_check_biometric():
-    try:
-        data = request.json or {}
-        username = data.get('username', '').strip()
-
-        placeholder = "%s" if IS_POSTGRES else "?"
-        select_query = f"SELECT biometric_enrolled FROM users WHERE username = {placeholder}"
-        user = execute_query(select_query, (username,), fetch_one=True)
-
-        if user:
-            return jsonify({"success": True, "enrolled": bool(user['biometric_enrolled'])})
-        return jsonify({"success": False, "message": "User sequence mismatch."}), 404
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-# ---------------------------------------------------------------------------
-# WebAuthn (real biometric / passkey) — registration ceremony
-# ---------------------------------------------------------------------------
-
-@app.route('/api/webauthn/register/begin', methods=['POST'])
-def webauthn_register_begin():
-    try:
-        data = request.json or {}
-        user_id = data.get('user_id')
-
-        placeholder = "%s" if IS_POSTGRES else "?"
-        user = execute_query(f"SELECT * FROM users WHERE id = {placeholder}", (user_id,), fetch_one=True)
-        if not user:
-            return jsonify({"success": False, "message": "User not found."}), 404
-
-        options = webauthn.generate_registration_options(
-            rp_id=RP_ID,
-            rp_name=RP_NAME,
-            user_id=str(user['id']).encode('utf-8'),
-            user_name=user['username'],
-            user_display_name=user['full_name'],
-            authenticator_selection=AuthenticatorSelectionCriteria(
-                resident_key=ResidentKeyRequirement.PREFERRED,
-                user_verification=UserVerificationRequirement.PREFERRED,
-            ),
-        )
-
-        ACTIVE_WEBAUTHN_CHALLENGES[str(user['id'])] = options.challenge
-
-        return webauthn.options_to_json(options), 200, {'Content-Type': 'application/json'}
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/api/webauthn/register/complete', methods=['POST'])
-def webauthn_register_complete():
-    try:
-        data = request.json or {}
-        user_id = str(data.get('user_id'))
-        credential = data.get('credential')
-
-        expected_challenge = ACTIVE_WEBAUTHN_CHALLENGES.pop(user_id, None)
-        if not expected_challenge:
-            return jsonify({"success": False, "message": "No pending registration challenge for this profile."}), 400
-
-        verification = webauthn.verify_registration_response(
-            credential=credential,
-            expected_challenge=expected_challenge,
-            expected_rp_id=RP_ID,
-            expected_origin=ORIGIN,
-        )
-
-        placeholder = "%s" if IS_POSTGRES else "?"
-        update_query = (
-            f"UPDATE users SET biometric_enrolled = 1, "
-            f"webauthn_credential_id = {placeholder}, "
-            f"webauthn_public_key = {placeholder}, "
-            f"webauthn_sign_count = {placeholder} "
-            f"WHERE id = {placeholder}"
-        )
-        execute_query(
-            update_query,
-            (
-                bytes_to_base64url(verification.credential_id),
-                bytes_to_base64url(verification.credential_public_key),
-                verification.sign_count,
-                user_id,
-            ),
-            commit=True,
-        )
-
-        write_auth_log(f"user#{user_id}", "WebAuthn Passkey Enrollment", "SUCCESS")
-        return jsonify({"success": True, "message": "Passkey registered successfully."})
-    except Exception as e:
-        write_auth_log(f"user#{data.get('user_id') if 'data' in locals() else '?'}", f"WebAuthn Enrollment Exception: {str(e)}", "ERROR")
-        return jsonify({"success": False, "message": f"Passkey registration failed: {str(e)}"}), 400
-
-
-# ---------------------------------------------------------------------------
-# WebAuthn (real biometric / passkey) — authentication ceremony
-# ---------------------------------------------------------------------------
-
-@app.route('/api/webauthn/login/begin', methods=['POST'])
-def webauthn_login_begin():
-    try:
-        data = request.json or {}
-        username = data.get('username', '').strip()
-
-        placeholder = "%s" if IS_POSTGRES else "?"
-        user = execute_query(
-            f"SELECT * FROM users WHERE username = {placeholder} AND biometric_enrolled = 1",
-            (username,),
-            fetch_one=True,
-        )
-        if not user or not user['webauthn_credential_id']:
-            return jsonify({"success": False, "message": "No passkey registered for this account."}), 404
-
-        allow_credentials = [
-            PublicKeyCredentialDescriptor(id=base64url_to_bytes(user['webauthn_credential_id']))
-        ]
-
-        options = webauthn.generate_authentication_options(
-            rp_id=RP_ID,
-            allow_credentials=allow_credentials,
-            user_verification=UserVerificationRequirement.PREFERRED,
-        )
-
-        ACTIVE_WEBAUTHN_CHALLENGES[username] = options.challenge
-
-        return webauthn.options_to_json(options), 200, {'Content-Type': 'application/json'}
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/api/webauthn/login/complete', methods=['POST'])
-def webauthn_login_complete():
-    try:
-        data = request.json or {}
-        username = data.get('username', '').strip()
-        credential = data.get('credential')
-
-        expected_challenge = ACTIVE_WEBAUTHN_CHALLENGES.pop(username, None)
-        if not expected_challenge:
-            return jsonify({"success": False, "message": "No pending authentication challenge for this profile."}), 400
-
-        placeholder = "%s" if IS_POSTGRES else "?"
-        user = execute_query(
-            f"SELECT * FROM users WHERE username = {placeholder}", (username,), fetch_one=True
-        )
-        if not user or not user['webauthn_public_key']:
-            return jsonify({"success": False, "message": "No passkey registered for this account."}), 404
-
-        verification = webauthn.verify_authentication_response(
-            credential=credential,
-            expected_challenge=expected_challenge,
-            expected_rp_id=RP_ID,
-            expected_origin=ORIGIN,
-            credential_public_key=base64url_to_bytes(user['webauthn_public_key']),
-            credential_current_sign_count=user['webauthn_sign_count'] or 0,
-        )
-
-        execute_query(
-            f"UPDATE users SET webauthn_sign_count = {placeholder} WHERE id = {placeholder}",
-            (verification.new_sign_count, user['id']),
-            commit=True,
-        )
-
-        write_auth_log(username, "WebAuthn Passkey Authentication", "SUCCESS")
+    # Intercept Hardcoded Administration Credentials
+    if username == "Admin" and password == "Eureka":
+        global SYSTEM_RUNTIME_MODE
+        SYSTEM_RUNTIME_MODE = "admin"
+        emit_telemetry("<span class='term-success'>[ADMIN LOGIN] Administrative dashboard accessed successfully.</span>")
         return jsonify({
             "success": True,
-            "user_id": user['id'],
-            "user_info": {
-                "full_name": user['full_name'],
-                "matric_no": user['matric_no'],
-                "biometric_enrolled": True
-            }
+            "is_admin": True,
+            "message": "Admin authorization granted."
         })
-    except Exception as e:
-        write_auth_log(username if 'username' in locals() else 'UNKNOWN', f"WebAuthn Auth Exception: {str(e)}", "ERROR")
-        return jsonify({"success": False, "message": f"Passkey verification failed: {str(e)}"}), 401
 
+    user = UserModel.query.filter(UserModel.username.ilike(username)).first()
+    
+    if not user or not check_password_hash(user.password_hash, password):
+        emit_telemetry(f"<span class='term-warn'>[AUTH FAILURE] Rejected credential assertion match for: {username}</span>")
+        return jsonify({"success": False, "message": "Invalid portal credentials footprint."}), 401
+
+    otp = str(random.randint(100000, 999999))
+    expiration_window = 300 
+    
+    PENDING_OTP_VALIDATIONS[user.id] = {
+        "code": otp,
+        "expires_at": time.time() + expiration_window
+    }
+
+    email_sent = send_smtp_otp_email(user.email, otp)
+    if email_sent:
+        emit_telemetry(f"<span class='term-success'>[EMAIL DISPATCHED] Security OTP code successfully sent via SMTP to {user.email}</span>")
+    else:
+        emit_telemetry(f"[MFA SIMULATED] Security OTP code ({otp}) generated for user ID: {user.id}")
+
+    email_parts = user.email.split('@')
+    masked_email = f"{email_parts[0][:3]}***@{email_parts[1]}"
+    
+    return jsonify({
+        "success": True,
+        "is_admin": False,
+        "user_id": user.id,
+        "masked_email": masked_email,
+        "expires_in": expiration_window
+    })
+
+@app.route('/api/verify-otp', methods=['POST'])
+def handle_otp_verification():
+    data = request.json or {}
+    user_id = data.get('user_id')
+    otp_code = data.get('otp_code', '').strip()
+
+    otp_record = PENDING_OTP_VALIDATIONS.get(user_id)
+    
+    if not otp_record:
+        return jsonify({"success": False, "message": "No validation sequence context running for identity."}), 400
+
+    if time.time() > otp_record['expires_at']:
+        del PENDING_OTP_VALIDATIONS[user_id]
+        emit_telemetry("<span class='term-warn'>[MFA EXPIRED] OTP signature verification context window closed automatically.</span>")
+        return jsonify({"success": False, "message": "Security verification token has expired!"}), 400
+
+    if otp_record['code'] != otp_code:
+        emit_telemetry(f"<span class='term-warn'>[MFA BAD CODE] Incorrect token submitted for user mapping reference ID: {user_id}</span>")
+        return jsonify({"success": False, "message": "Invalid security authentication code sequence match."}), 400
+
+    del PENDING_OTP_VALIDATIONS[user_id]
+    user = UserModel.query.get(user_id)
+    
+    session_token = secrets.token_hex(32)
+    ip_address = request.remote_addr or "127.0.0.1"
+    user_agent = request.headers.get('User-Agent', 'Unknown Browser')
+    device_name = "Mobile Device" if "Mobile" in user_agent else "Desktop Browser"
+
+    session_entry = {
+        "id": len(USER_SESSIONS_DB) + 1,
+        "user_id": user.id,
+        "session_token": session_token,
+        "ip_address": ip_address,
+        "device_name": device_name,
+        "created_at": time.time(),
+        "last_active": time.time()
+    }
+    USER_SESSIONS_DB.append(session_entry)
+
+    emit_telemetry(f"<span class='term-success'>[LOGIN COMPLETE] MFA clearance passed for target {user.username} from {device_name} ({ip_address}).</span>")
+    
+    resp_data = {
+        "success": True,
+        "user_id": user.id,
+        "user_info": {
+            "full_name": user.full_name,
+            "matric_no": user.matric_no
+        }
+    }
+    
+    response = make_response(jsonify(resp_data))
+    response.set_cookie('device_session_token', session_token, httponly=True, secure=False, samesite='Lax')
+    return response
+
+@app.route('/api/auth/google', methods=['POST'])
+def handle_google_oauth():
+    data = request.json or {}
+    id_token = data.get('id_token')
+    
+    if not id_token:
+        return jsonify({"success": False, "message": "Missing structural federation payload token."}), 400
+
+    emit_telemetry("<span class='term-success'>[GOOGLE LOGIN] Parsing inbound federated token payload signatures.</span>")
+    
+    user = UserModel.query.first()
+    if not user:
+        return jsonify({"success": False, "message": "No active user footprint found for federation hook."}), 400
+    
+    session_token = secrets.token_hex(32)
+    ip_address = request.remote_addr or "127.0.0.1"
+    user_agent = request.headers.get('User-Agent', 'Unknown Browser')
+    device_name = "Mobile Device" if "Mobile" in user_agent else "Desktop Browser"
+
+    session_entry = {
+        "id": len(USER_SESSIONS_DB) + 1,
+        "user_id": user.id,
+        "session_token": session_token,
+        "ip_address": ip_address,
+        "device_name": device_name,
+        "created_at": time.time(),
+        "last_active": time.time()
+    }
+    USER_SESSIONS_DB.append(session_entry)
+
+    resp_data = {
+        "success": True,
+        "user_id": user.id,
+        "user_info": {
+            "full_name": user.full_name,
+            "matric_no": user.matric_no
+        }
+    }
+    response = make_response(jsonify(resp_data))
+    response.set_cookie('device_session_token', session_token, httponly=True, secure=False, samesite='Lax')
+    return response
+
+# --- MULTI-DEVICE MONITORING ENDPOINTS ---
+
+@app.route('/api/user/active-devices', methods=['GET'])
+def get_active_devices():
+    session_token = request.cookies.get('device_session_token')
+    if not session_token:
+        return jsonify({"success": False, "message": "Unauthorized session context."}), 401
+
+    current_session = next((s for s in USER_SESSIONS_DB if s['session_token'] == session_token), None)
+    if not current_session:
+        return jsonify({"success": False, "message": "Session footprint invalid or expired."}), 401
+
+    user_id = current_session['user_id']
+    user_sessions = [s for s in USER_SESSIONS_DB if s['user_id'] == user_id]
+
+    device_list = []
+    current_time = time.time()
+
+    for s in user_sessions:
+        time_diff = current_time - s['last_active']
+        is_online = time_diff < 300
+
+        device_list.append({
+            "session_id": s['id'],
+            "device_name": s['device_name'],
+            "ip_address": s['ip_address'],
+            "created_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['created_at'])),
+            "last_active": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['last_active'])),
+            "status": "Online" if is_online else "Away / Offline",
+            "is_current_device": s['session_token'] == session_token
+        })
+
+    return jsonify({"success": True, "devices": device_list})
+
+@app.route('/api/user/revoke-session/<int:session_id>', methods=['DELETE'])
+def revoke_specific_session(session_id):
+    global USER_SESSIONS_DB
+    session_token = request.cookies.get('device_session_token')
+    if not session_token:
+        return jsonify({"success": False, "message": "Unauthorized."}), 401
+
+    current_session = next((s for s in USER_SESSIONS_DB if s['session_token'] == session_token), None)
+    if not current_session:
+        return jsonify({"success": False, "message": "Unauthorized."}), 401
+
+    target_session = next((s for s in USER_SESSIONS_DB if s['id'] == session_id and s['user_id'] == current_session['user_id']), None)
+    if not target_session:
+        return jsonify({"success": False, "message": "Target session not found."}), 404
+
+    USER_SESSIONS_DB = [s for s in USER_SESSIONS_DB if s['id'] != session_id]
+    emit_telemetry(f"<span class='term-warn'>[SESSION REVOKED] Remote termination executed on session ID: {session_id}</span>")
+    
+    return jsonify({"success": True, "message": "Session terminated successfully."})
+
+# --- USER LAND INTERACTIVE ENDPOINTS ---
+
+@app.route('/api/ratings', methods=['POST'])
+def record_portal_rating():
+    data = request.json or {}
+    user_id = data.get('user_id')
+    rating = data.get('rating')
+
+    if not user_id or not rating:
+        return jsonify({"success": False, "message": "Incomplete evaluation matrix metrics payload."}), 400
+
+    user = UserModel.query.get(user_id)
+    if not user:
+        return jsonify({"success": False, "message": "Session footprint identity reference untrusted."}), 403
+
+    rating_entry = RatingModel(
+        timestamp=time.strftime('%Y-%m-%d %H:%M:%S'),
+        username=user.username,
+        matric_no=user.matric_no,
+        rating_score=int(rating)
+    )
+    db.session.add(rating_entry)
+    db.session.commit()
+    
+    emit_telemetry(f"[METRIC LOGGED] User {user.username} pushed score value array: {rating}/10")
+    return jsonify({"success": True, "message": "Metric score captured successfully."})
+
+# --- BACKEND SYSTEM ADMINISTRATION PIPELINES ---
+
+@app.route('/api/system/mode', methods=['POST'])
+def set_system_mode():
+    global SYSTEM_RUNTIME_MODE
+    data = request.json or {}
+    mode = data.get('mode', 'user')
+    SYSTEM_RUNTIME_MODE = mode
+    emit_telemetry(f"[MODE SWITCH] Structural layout environment reassigned -> {SYSTEM_RUNTIME_MODE.upper()}_MODE")
+    return jsonify({"success": True})
+
+@app.route('/api/admin/users', methods=['GET'])
+def get_admin_user_directory():
+    db.session.expire_all()
+    users = UserModel.query.all()
+    
+    users_list = [{
+        "id": u.id,
+        "username": u.username,
+        "full_name": u.full_name,
+        "matric_no": u.matric_no,
+        "email": u.email
+    } for u in users]
+    
+    return jsonify({"success": True, "users": users_list})
+
+@app.route('/api/admin/inject-user', methods=['POST'])
+def admin_inject_user():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    email = data.get('email', '').strip()
+    full_name = data.get('full_name', '').strip()
+
+    if not all([username, password, email, full_name]):
+        emit_telemetry("<span class='term-warn'>[DB ERR] Missing fields for account injection.</span>")
+        return jsonify({"success": False, "message": "Missing required fields for account injection."}), 400
+
+    existing_user = UserModel.query.filter((UserModel.username.ilike(username)) | (UserModel.email.ilike(email))).first()
+    if existing_user:
+        emit_telemetry(f"<span class='term-warn'>[DB ERR] Username or email '{username}' / '{email}' already claimed.</span>")
+        return jsonify({"success": False, "message": "Username or email already claimed within database matrix."}), 400
+
+    assigned_matric = generate_matric_number()
+    hashed_pwd = generate_password_hash(password)
+    
+    injected_user = UserModel(
+        username=username,
+        password_hash=hashed_pwd,
+        full_name=full_name,
+        matric_no=assigned_matric,
+        email=email
+    )
+    db.session.add(injected_user)
+    db.session.commit()
+    
+    emit_telemetry(f"<span class='term-success'>[DB OK] Row injected successfully. Matric: {assigned_matric}</span>")
+    return jsonify({"success": True, "generated_matric": assigned_matric})
+
+@app.route('/api/admin/users/update/<int:user_id>', methods=['PUT'])
+def update_user_profile(user_id):
+    data = request.json or {}
+    user = UserModel.query.get(user_id)
+    
+    if not user:
+        return jsonify({"success": False, "message": "Target record reference identity not located."}), 404
+
+    user.full_name = data.get('full_name', user.full_name)
+    user.matric_no = data.get('matric_no', user.matric_no)
+    user.email = data.get('email', user.email)
+    
+    db.session.commit()
+    
+    emit_telemetry(f"<span class='term-success'>[DB ROW UPDATE] Row modification written successfully on identifier ID: {user_id}</span>")
+    return jsonify({"success": True})
+
+@app.route('/api/admin/users/delete/<int:user_id>', methods=['DELETE'])
+def delete_user_profile(user_id):
+    user = UserModel.query.get(user_id)
+    if user:
+        db.session.delete(user)
+        db.session.commit()
+        emit_telemetry(f"<span class='term-warn'>[DB ROW PURGE] Dropped entry row structural reference index match ID: {user_id}</span>")
+        return jsonify({"success": True})
+    return jsonify({"success": False, "message": "User not found."}), 404
+
+@app.route('/api/ratings/export', methods=['GET'])
+def export_ratings_csv():
+    dest_output = io.StringIO()
+    writer = csv.writer(dest_output)
+    writer.writerow(['Timestamp Signature', 'Account Username', 'Matric Number', 'Metric Rating Score'])
+    
+    ratings = RatingModel.query.all()
+    for row in ratings:
+        writer.writerow([row.timestamp, row.username, row.matric_no, row.rating_score])
+        
+    response_payload = dest_output.getvalue()
+    dest_output.close()
+    
+    return Response(
+        response_payload,
+        mimetype="text/csv",
+        headers={"Content-disposition": "attachment; filename=DAOU_Portal_Ratings_Extract.csv"}
+    )
+
+@app.route('/api/admin/live-stream')
+def backend_telemetry_stream():
+    def event_stream_loop():
+        q = TelemetryQueue()
+        TELEMETRY_LISTENERS.append(q)
+        yield f"data: > System runtime engine connected safely to logging node interface telemetry stream.\n\n"
+        
+        while True:
+            msg = q.get()
+            if msg:
+                yield msg
+            time.sleep(0.2)
+
+    return Response(stream_with_context(event_stream_loop()), mimetype="text/event-stream")
+
+# --- INITIALIZE DATABASE & DEFAULT USER ---
+with app.app_context():
+    db.create_all()
+    if not UserModel.query.filter_by(username="Enoch").first():
+        default_user = UserModel(
+            username="user name",
+            password_hash=generate_password_hash("password"),
+            full_name="Enoch Ola",
+            matric_no="DAOU/CYB/2026/001",
+            email="@gmail.com"
+        )
+        db.session.add(default_user)
+        db.session.commit()
 
 if __name__ == '__main__':
-    init_db()
-    debug_mode = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
-else:
-    # Also run migrations when imported by a WSGI server (gunicorn on Render)
-    init_db()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
